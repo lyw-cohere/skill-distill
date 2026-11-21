@@ -172,7 +172,7 @@ def skill_package(workspace, files):
     return original, runtime_name, package
 
 
-def collect_files(client, conversation_id, workspace, trace_dir, files):
+def collect_files(client, conversation_id, workspace, trace_dir, files, *, replace_missing=True):
     remote = []
     next_token = None
     seen_tokens = set()
@@ -221,9 +221,10 @@ def collect_files(client, conversation_id, workspace, trace_dir, files):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(content)
             dest.chmod(modes.get(relative, 0o644))
-        for name, path, _ in files:
-            if not name.startswith(".skill/") and name not in returned:
-                path.unlink(missing_ok=True)
+        if replace_missing:
+            for name, path, _ in files:
+                if not name.startswith(".skill/") and name not in returned:
+                    path.unlink(missing_ok=True)
         for _, relative in remote:
             target = workspace / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -249,12 +250,20 @@ def run(args):
     conversation_id = None
     skill_id = None
     owned_agent = not agent_id
+    stream_started = False
+    artifacts_collected = False
     metadata = {"model": args.model, "provider_instance": args.provider_instance}
     try:
         if owned_agent:
             agent = client.json("POST", "/v2/agents", {"name": "skill-distill-" + uuid.uuid4().hex[:12],
                                 "model": args.model, "visibility": "private", "instructions": ""})
             agent_id = agent["id"]
+            agent_config = {}
+        else:
+            agent_config = client.json("GET", f"/internal/v1/agents/{agent_id}")
+            agent_config = agent_config.get("agent", agent_config)
+            if not isinstance(agent_config, dict) or agent_config.get("id") != agent_id:
+                raise NorthError("North did not return the requested existing agent")
         conversation = client.json("POST", "/v2/conversations", {"agent_id": agent_id, "title": "skill-distill trial"})
         conversation_id = conversation["id"]
         metadata.update(agent_id=agent_id, conversation_id=conversation_id)
@@ -282,11 +291,14 @@ def run(args):
         bootstrap += [f"chmod -- {mode:o} {shlex.quote(name)}" for name, _, mode in files if mode & 0o111]
         bootstrap += ["git add -A", "git -c commit.gpgsign=false -c user.name=skill-distill -c user.email=skill-distill@localhost "
                       "commit -q --allow-empty -m start"]
-        instruction = (f"Your trial workspace is {root}. Before the task, run this setup command:\n"
-                       + " && ".join(bootstrap) + f"\nRun subsequent shell commands from {root}. "
+        instruction = ("MANDATORY FIRST TOOL ACTION: run this complete setup command before reading "
+                       "the task skill or doing any task work. The trial root does not exist until it succeeds:\n"
+                       + " && ".join(bootstrap) + f"\nAfter it succeeds, run subsequent shell commands from {root}. "
                        "The frozen task skill is in .skill/ as the user prompt specifies. "
                        "Keep task files in this workspace so they can be collected. "
                        f"Use only the trial skill {source}; ignore unrelated skills under /mnt/skills.")
+        if agent_config and (agent_config.get("preamble") or "").strip():
+            instruction += "\n\nExisting agent instructions:\n" + agent_config["preamble"].strip()
         request = {"agent": {"id": agent_id}, "conversation": {"id": conversation_id},
                    "model": args.model, "stream": True, "messages": [{"role": "user", "content": prompt}],
                    "instruction": instruction, "use_memory": False,
@@ -294,13 +306,28 @@ def run(args):
         if owned_agent:
             request["tools"] = [{"type": "north_tool", "north_tool": {"name": "sandbox"}}]
             request["libraries"] = []
-        if args.provider_instance:
-            request["provider_instance"] = args.provider_instance
+        else:
+            tool_names = list(dict.fromkeys([*(agent_config.get("tools") or []), "sandbox"]))
+            if not all(isinstance(name, str) and name for name in tool_names):
+                raise NorthError("Existing agent returned an invalid tool selection")
+            request["tools"] = [
+                {"type": "north_tool", "north_tool": {"name": name}} for name in tool_names
+            ]
+            # Agent-level libraries stay on the persistent agent. Some North
+            # deployments disable conversation-level library overrides and
+            # reject the same IDs here even though the agent can use them.
+            if agent_config.get("reasoning_options") is not None:
+                request["thinking"] = agent_config["reasoning_options"]
+        provider_instance = (args.provider_instance or agent_config.get("model_instance")
+                             or agent_config.get("model_provider"))
+        if provider_instance:
+            request["provider_instance"] = provider_instance
         completed = False
         with (trace_dir / "session.jsonl").open("w") as trace:
             trace.write(json.dumps({"type": "north-session", "prompt": prompt, **metadata}) + "\n")
             trace.flush()
             with client.open("POST", "/internal/v2/chat", payload=request) as response:
+                stream_started = True
                 for event in sse_events(response):
                     trace.write(json.dumps(event) + "\n")
                     trace.flush()
@@ -326,9 +353,17 @@ def run(args):
         conversation = client.json("GET", f"/internal/v2/conversations/{conversation_id}?include_debug_info=false")
         (trace_dir / "conversation.json").write_text(json.dumps(conversation, indent=2))
         collect_files(client, conversation_id, workspace, trace_dir, files)
+        artifacts_collected = True
         metadata["complete"] = True
         print("\nNorth trial complete", flush=True)
     finally:
+        if stream_started and conversation_id and not artifacts_collected:
+            try:
+                collect_files(client, conversation_id, workspace, trace_dir, files, replace_missing=False)
+                metadata["partial_artifacts"] = True
+            except (NorthError, OSError, ValueError) as error:
+                print("North partial artifacts: " + str(error), file=sys.stderr)
+                metadata["partial_artifacts_error"] = str(error)
         if not args.keep_remote:
             for path in ([f"/v1/conversations/{conversation_id}"] if conversation_id else []) + (
                     [f"/v2/agents/{agent_id}"] if owned_agent and agent_id else []) + (

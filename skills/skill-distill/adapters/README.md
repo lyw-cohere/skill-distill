@@ -1,7 +1,7 @@
 # Harness adapters
 
-Each adapter runs one headless agent session and exits. `distill.py trial` calls it inside a tmux window,
-so you can watch it live with `tmux attach -t <session>`.
+Each adapter runs one headless agent session and exits. `distill.py trial` uses a tmux window when available,
+or a detached process otherwise.
 
 Environment passed in:
 
