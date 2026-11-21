@@ -183,17 +183,7 @@ def trial_dirs(run, n):
 def state(t):
     if (t / "exit_code").exists():
         return f"exit {(t / 'exit_code').read_text().strip()}"
-    pid_file = t / "pid"
-    if pid_file.exists():
-        try:
-            os.kill(int(pid_file.read_text().strip()), 0)
-        except (OSError, ValueError):
-            return "stale"
     return "running" if (t / "started_at").exists() else "pending"
-
-
-def finished(t):
-    return (t / "exit_code").exists() or state(t) == "stale"
 
 
 def cmd_status(a):
@@ -211,7 +201,7 @@ def cmd_wait(a):
     deadline = time.time() + a.timeout
     while True:
         ts = trial_dirs(run, n)
-        if ts and all(finished(t) for t in ts):
+        if ts and all((t / "exit_code").exists() for t in ts):
             cmd_status(a)
             return
         if time.time() > deadline:
