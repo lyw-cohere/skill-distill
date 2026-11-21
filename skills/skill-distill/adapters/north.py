@@ -241,6 +241,18 @@ def run(args):
         raise NorthError("Set MODEL to the North student model")
     if args.turns < 1:
         raise NorthError("--turns must be at least 1")
+    trial_instruction = ""
+    if args.instruction_file:
+        instruction_path = (workspace / args.instruction_file).resolve()
+        if (Path(args.instruction_file).is_absolute()
+                or not instruction_path.is_relative_to(workspace)
+                or not instruction_path.is_file()):
+            raise NorthError("--instruction-file must name a file inside WORKSPACE")
+        if instruction_path.stat().st_size > 32 * 1024:
+            raise NorthError("--instruction-file exceeds 32 KiB")
+        trial_instruction = instruction_path.read_text().strip()
+        if not trial_instruction or "\0" in trial_instruction:
+            raise NorthError("--instruction-file is empty or invalid")
     token = (Path(args.token_file).read_text().strip() if args.token_file else
              os.environ.get("NORTH_TOKEN") or os.environ.get("NORTH_JWT"))
     if not token or "\n" in token or "\r" in token:
@@ -255,7 +267,8 @@ def run(args):
     stream_started = False
     artifacts_collected = False
     metadata = {"model": args.model, "provider_instance": args.provider_instance,
-                "turns_requested": args.turns, "turns_completed": 0}
+                "turns_requested": args.turns, "turns_completed": 0,
+                "instruction_file": args.instruction_file}
     try:
         if owned_agent:
             agent = client.json("POST", "/v2/agents", {"name": "skill-distill-" + uuid.uuid4().hex[:12],
@@ -300,6 +313,8 @@ def run(args):
                        "The frozen task skill is in .skill/ as the user prompt specifies. "
                        "Keep task files in this workspace so they can be collected. "
                        f"Use only the trial skill {source}; ignore unrelated skills under /mnt/skills.")
+        if trial_instruction:
+            instruction += "\n\nAuthoritative trial fixture instructions:\n" + trial_instruction
         if agent_config and (agent_config.get("preamble") or "").strip():
             instruction += "\n\nExisting agent instructions:\n" + agent_config["preamble"].strip()
         request = {"agent": {"id": agent_id}, "conversation": {"id": conversation_id},
@@ -344,6 +359,9 @@ def run(args):
                     request["instruction"] = (
                         f"Resume work in {root}; it is already initialized. Do not recreate or reset it. "
                         "Keep using the selected frozen task skill and the same external task state.")
+                    if trial_instruction:
+                        request["instruction"] += ("\n\nAuthoritative trial fixture instructions:\n"
+                                                   + trial_instruction)
                     if agent_config and (agent_config.get("preamble") or "").strip():
                         request["instruction"] += ("\n\nExisting agent instructions:\n"
                                                    + agent_config["preamble"].strip())
@@ -385,6 +403,13 @@ def run(args):
     finally:
         if stream_started and conversation_id and not artifacts_collected:
             try:
+                client.json("POST", f"/internal/v2/conversations/{conversation_id}/cancel")
+            except NorthError as error:
+                if error.status not in (400, 404):
+                    print("North cancellation: " + str(error), file=sys.stderr)
+                    metadata["cancellation_error"] = str(error)
+        if stream_started and conversation_id and not artifacts_collected:
+            try:
                 collect_files(client, conversation_id, workspace, trace_dir, files, replace_missing=False)
                 metadata["partial_artifacts"] = True
             except (NorthError, OSError, ValueError) as error:
@@ -414,6 +439,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=300, help="Per-request socket timeout in seconds")
     parser.add_argument("--turns", type=int, default=1,
                         help="Consecutive turns in one conversation (default: 1)")
+    parser.add_argument("--instruction-file", default=os.environ.get("NORTH_INSTRUCTION_FILE"),
+                        help="Relative WORKSPACE file appended to the North system instruction")
     parser.add_argument("--keep-remote", action="store_true", help="Keep the trial conversation and temporary agent")
     args = parser.parse_args(shlex.split(os.environ.get("STUDENT_ARGS", "")) + sys.argv[1:])
     def interrupted(signum, frame):

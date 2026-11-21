@@ -9,6 +9,11 @@ from the existing files and live external state, do not rerun bootstrap, and
 verify completed-looking work rather than trusting a prior reply; the default
 remains one.
 
+For trials whose setup creates an isolated external fixture, pass a small
+relative `--instruction-file` from `WORKSPACE`. Its contents are added to the
+North system instruction on every turn, so a fresh resource ID can override a
+stale ID that must remain in the verbatim reference prompt.
+
 Environment passed in:
 
 | var | meaning |
