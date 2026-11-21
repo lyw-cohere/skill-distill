@@ -239,6 +239,8 @@ def run(args):
     prompt = Path(os.environ["PROMPT_FILE"]).read_text()
     if not args.model:
         raise NorthError("Set MODEL to the North student model")
+    if args.turns < 1:
+        raise NorthError("--turns must be at least 1")
     token = (Path(args.token_file).read_text().strip() if args.token_file else
              os.environ.get("NORTH_TOKEN") or os.environ.get("NORTH_JWT"))
     if not token or "\n" in token or "\r" in token:
@@ -252,7 +254,8 @@ def run(args):
     owned_agent = not agent_id
     stream_started = False
     artifacts_collected = False
-    metadata = {"model": args.model, "provider_instance": args.provider_instance}
+    metadata = {"model": args.model, "provider_instance": args.provider_instance,
+                "turns_requested": args.turns, "turns_completed": 0}
     try:
         if owned_agent:
             agent = client.json("POST", "/v2/agents", {"name": "skill-distill-" + uuid.uuid4().hex[:12],
@@ -322,34 +325,57 @@ def run(args):
                              or agent_config.get("model_provider"))
         if provider_instance:
             request["provider_instance"] = provider_instance
-        completed = False
         with (trace_dir / "session.jsonl").open("w") as trace:
             trace.write(json.dumps({"type": "north-session", "prompt": prompt, **metadata}) + "\n")
             trace.flush()
-            with client.open("POST", "/internal/v2/chat", payload=request) as response:
-                stream_started = True
-                for event in sse_events(response):
-                    trace.write(json.dumps(event) + "\n")
-                    trace.flush()
-                    event_type = event.get("type")
-                    if event_type == "content-delta":
-                        content = event.get("delta", {}).get("message", {}).get("content")
-                        text = content if isinstance(content, str) else (content or {}).get("text", "")
-                        print(text, end="", flush=True)
-                    elif event_type == "tool-call-start":
-                        call = event.get("delta", {}).get("message", {}).get("tool_calls") or {}
-                        print("\nTool: " + call.get("function", {}).get("name", ""), flush=True)
-                    elif event_type == "stream-end":
-                        delta = event.get("delta") or {}
-                        metadata["finish_reason"] = delta.get("finish_reason", "COMPLETE")
-                        if delta.get("error") or metadata["finish_reason"] != "COMPLETE":
-                            raise NorthError("North trial ended with " + metadata["finish_reason"])
-                        completed = True
-                        break
-                    elif event_type in ("error", "tool-elicitation-request"):
-                        raise NorthError("North trial requires intervention: " + event_type)
-        if not completed:
-            raise NorthError("North stream ended before stream-end")
+            for turn in range(1, args.turns + 1):
+                if turn > 1:
+                    request["messages"] = [{"role": "user", "content": (
+                        f"Continuation turn {turn} of {args.turns}. Continue the same task in the "
+                        "existing trial workspace. Do not rerun bootstrap or redo completed phases. "
+                        "First inspect both the live external task state with the summary/status call "
+                        "prescribed by the task skill and the current files and ID ledger. Treat live "
+                        "state as authoritative: do not infer that a phase is complete from the prior "
+                        "assistant reply or a prose file alone, and do not skip an unmet dependency. "
+                        "Resume the earliest incomplete gate and execute the remaining requirements. "
+                        "If the deliverables are present, use the turn to run the skill's end-to-end "
+                        "checks and repair the actual result. Work rather than list what remains; the "
+                        "prior assistant reply was only a progress checkpoint.")}]
+                    request["instruction"] = (
+                        f"Resume work in {root}; it is already initialized. Do not recreate or reset it. "
+                        "Keep using the selected frozen task skill and the same external task state.")
+                    if agent_config and (agent_config.get("preamble") or "").strip():
+                        request["instruction"] += ("\n\nExisting agent instructions:\n"
+                                                   + agent_config["preamble"].strip())
+                trace.write(json.dumps({"type": "north-turn", "turn": turn}) + "\n")
+                trace.flush()
+                completed = False
+                with client.open("POST", "/internal/v2/chat", payload=request) as response:
+                    stream_started = True
+                    for event in sse_events(response):
+                        trace.write(json.dumps(event) + "\n")
+                        trace.flush()
+                        event_type = event.get("type")
+                        if event_type == "content-delta":
+                            content = event.get("delta", {}).get("message", {}).get("content")
+                            text = content if isinstance(content, str) else (content or {}).get("text", "")
+                            print(text, end="", flush=True)
+                        elif event_type == "tool-call-start":
+                            call = event.get("delta", {}).get("message", {}).get("tool_calls") or {}
+                            print("\nTool: " + call.get("function", {}).get("name", ""), flush=True)
+                        elif event_type == "stream-end":
+                            delta = event.get("delta") or {}
+                            metadata["finish_reason"] = delta.get("finish_reason", "COMPLETE")
+                            if delta.get("error") or metadata["finish_reason"] != "COMPLETE":
+                                raise NorthError("North trial ended with " + metadata["finish_reason"])
+                            completed = True
+                            metadata["turns_completed"] = turn
+                            break
+                        elif event_type in ("error", "tool-elicitation-request"):
+                            raise NorthError("North trial requires intervention: " + event_type)
+                if not completed:
+                    raise NorthError("North stream ended before stream-end")
+                print(f"\nNorth turn {turn}/{args.turns} complete", flush=True)
         conversation = client.json("GET", f"/internal/v2/conversations/{conversation_id}?include_debug_info=false")
         (trace_dir / "conversation.json").write_text(json.dumps(conversation, indent=2))
         collect_files(client, conversation_id, workspace, trace_dir, files)
@@ -386,6 +412,8 @@ def main():
     parser.add_argument("--agent-id", default=os.environ.get("NORTH_AGENT_ID"),
                         help="Existing student agent (must include sandbox); its configuration is retained")
     parser.add_argument("--timeout", type=float, default=300, help="Per-request socket timeout in seconds")
+    parser.add_argument("--turns", type=int, default=1,
+                        help="Consecutive turns in one conversation (default: 1)")
     parser.add_argument("--keep-remote", action="store_true", help="Keep the trial conversation and temporary agent")
     args = parser.parse_args(shlex.split(os.environ.get("STUDENT_ARGS", "")) + sys.argv[1:])
     def interrupted(signum, frame):

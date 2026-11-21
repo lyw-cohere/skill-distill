@@ -3,6 +3,12 @@
 Each adapter runs one headless agent session and exits. `distill.py trial` uses a tmux window when available,
 or a detached process otherwise.
 
+The North adapter also accepts `--turns N` for long tasks that must resume in
+the same conversation, sandbox and external workspace. Later turns continue
+from the existing files and live external state, do not rerun bootstrap, and
+verify completed-looking work rather than trusting a prior reply; the default
+remains one.
+
 Environment passed in:
 
 | var | meaning |
