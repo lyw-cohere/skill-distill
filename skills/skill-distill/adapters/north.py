@@ -354,7 +354,11 @@ def run(args):
                         "assistant reply or a prose file alone, and do not skip an unmet dependency. "
                         "Resume the earliest incomplete gate and execute the remaining requirements. "
                         "If the deliverables are present, use the turn to run the skill's end-to-end "
-                        "checks and repair the actual result. Work rather than list what remains; the "
+                        "checks and repair the actual result. A checker that times out, cannot reach an "
+                        "external service, or was not run is a failed gate, not evidence that live state "
+                        "is correct. Use the configured read/status tool as the fallback and compare every "
+                        "required live name, identifier, bound and dependency before claiming completion. "
+                        "Work rather than list what remains; the "
                         "prior assistant reply was only a progress checkpoint.")}]
                     request["instruction"] = (
                         f"Resume work in {root}; it is already initialized. Do not recreate or reset it. "
