@@ -1,6 +1,6 @@
 ---
 name: skill-distill
-description: Turn a good coding-agent session (Claude Code, Codex, omp) into a skill that lets a chosen open-weight model in a chosen harness reproduce the same task, by looping: write the skill, run the student in tmux on a fresh copy of the starting state, compare its result with the reference, fix the skill, run again, until the student matches and the user accepts it. Use when the user says "distill this session", "make a skill so DeepSeek/GLM/Qwen can do what you just did", "teach <model> in <harness> to reproduce this", or "skill-distill". Not for writing a general-purpose skill from scratch with no reference session, and not for fine-tuning.
+description: Turn a good coding-agent session (Claude Code, Codex, omp) into a skill that lets a chosen open-weight model in a chosen harness reproduce the same task, by looping: write the skill, run the student detached on a fresh copy of the starting state, compare its result with the reference, fix the skill, run again, until the student matches and the user accepts it. Use when the user says "distill this session", "make a skill so DeepSeek/GLM/Qwen can do what you just did", "teach <model> in <harness> to reproduce this", or "skill-distill". Not for writing a general-purpose skill from scratch with no reference session, and not for fine-tuning.
 ---
 
 # skill-distill
@@ -97,8 +97,8 @@ weaker than you, often has a shorter usable context, and follows text literally.
 ## 5. Run the student
 
 ```
-python3 scripts/distill.py trial runs/<task> -k 3        # iteration N, 3 trials in tmux
-python3 scripts/distill.py status runs/<task>            # tmux attach -t distill-<task> to watch
+python3 scripts/distill.py trial runs/<task> -k 3        # iteration N, 3 detached trials
+python3 scripts/distill.py status runs/<task>            # use tmux attach when tmux is available
 python3 scripts/distill.py wait runs/<task> --timeout 540 # repeat until all trials exit
 ```
 

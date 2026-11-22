@@ -1,7 +1,18 @@
 # Harness adapters
 
-Each adapter runs one headless agent session and exits. `distill.py trial` calls it inside a tmux window,
-so you can watch it live with `tmux attach -t <session>`.
+Each adapter runs one headless agent session and exits. `distill.py trial` uses a tmux window when available,
+or a detached process otherwise.
+
+The North adapter also accepts `--turns N` for long tasks that must resume in
+the same conversation, sandbox and external workspace. Later turns continue
+from the existing files and live external state, do not rerun bootstrap, and
+verify completed-looking work rather than trusting a prior reply; the default
+remains one.
+
+For trials whose setup creates an isolated external fixture, pass a small
+relative `--instruction-file` from `WORKSPACE`. Its contents are added to the
+North system instruction on every turn, so a fresh resource ID can override a
+stale ID that must remain in the verbatim reference prompt.
 
 Environment passed in:
 

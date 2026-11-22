@@ -5,7 +5,7 @@ The teacher (the agent following SKILL.md) decides what goes in the skill and ju
 This script does the bookkeeping that must not drift between iterations:
 
   init      create a run: reference summary, frozen prompt, starting state, empty student skill
-  trial     freeze the current skill as iteration N and start K student sessions in tmux
+  trial     freeze the current skill as iteration N and start K detached student sessions
   status    show which trials are still running
   wait      block until an iteration's trials exit (or timeout)
   evidence  collect what each trial produced: trace summary, files, diff, checks.sh output
@@ -130,8 +130,9 @@ def cmd_trial(a):
         raise SystemExit(f"{it} exists; use a new --iter")
     shutil.copytree(run / "skill", it / "skill")
     session = cfg["tmux"]
-    if sh(["tmux", "has-session", "-t", session], timeout=10).returncode:
-        sh(["tmux", "new-session", "-d", "-s", session, "-n", "ledger", f"tail -F {run}/ledger.jsonl"], timeout=10)
+    tmux = shutil.which("tmux")
+    if tmux and sh([tmux, "has-session", "-t", session], timeout=10).returncode:
+        sh([tmux, "new-session", "-d", "-s", session, "-n", "ledger", f"tail -F {run}/ledger.jsonl"], timeout=10)
     prompt = (run / "prompt.md").read_text().rstrip() + SKILL_POINTER.format(name=cfg["name"])
     for k in range(1, a.k + 1):
         t = it / f"t{k}"
@@ -155,11 +156,24 @@ date -Iseconds > {t}/ended_at
 echo "== trial done (exit $(cat {t}/exit_code)) =="
 """)
         win = f"i{n:02d}-t{k}"
-        r = sh(["tmux", "new-window", "-d", "-t", session, "-n", win, f"bash {t}/run.sh; sleep 86400"], timeout=10)
-        if r.returncode:
-            raise SystemExit(f"tmux failed: {r.stderr}")
-        print(f"started {session}:{win}  ->  {t}")
-    print(f"watch: tmux attach -t {session}")
+        if tmux:
+            r = sh([tmux, "new-window", "-d", "-t", session, "-n", win,
+                    f"bash {t}/run.sh; sleep 86400"], timeout=10)
+            if r.returncode:
+                raise SystemExit(f"tmux failed: {r.stderr}")
+            print(f"started {session}:{win}  ->  {t}")
+        else:
+            with open(t / "launcher.log", "w") as launcher:
+                process = subprocess.Popen(["bash", str(t / "run.sh")], cwd=t,
+                                           stdin=subprocess.DEVNULL,
+                                           stdout=launcher, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
+            (t / "pid").write_text(str(process.pid) + "\n")
+            print(f"started pid {process.pid}  ->  {t}")
+    if tmux:
+        print(f"watch: tmux attach -t {session}")
+    else:
+        print(f"watch: python3 {Path(__file__).name} status {run}")
 
 
 def trial_dirs(run, n):

@@ -6,6 +6,7 @@ Supported logs (auto-detected):
   codex       Codex rollout            ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
   codex-exec  `codex exec --json` stdout
   omp         oh-my-pi / pi session    ~/.omp/agent/sessions/<slug>/*.jsonl
+  north       North adapter header + raw chat SSE events
 
 Usage:
   extract_session.py LOG [-o reference.md] [--json reference.json]
@@ -52,6 +53,8 @@ def read_jsonl(path):
 def detect(rows):
     for o in rows[:50]:
         t = o.get("type")
+        if t == "north-session":
+            return "north"
         if t in ("session_meta", "response_item", "turn_context"):
             return "codex"
         if t in ("thread.started", "item.completed", "item.started", "turn.started"):
@@ -171,7 +174,90 @@ def parse_omp(rows):
             yield ("result", text_of(m.get("content")), bool(m.get("isError")))
 
 
-PARSERS = {"claude": parse_claude, "codex": parse_codex, "codex-exec": parse_codex_exec, "omp": parse_omp}
+def parse_north(rows):
+    text, calls, results, tool_messages = [], {}, {}, {}
+    for o in rows:
+        kind = o.get("type")
+        message = (o.get("delta") or {}).get("message") or {}
+        if kind == "north-session":
+            yield ("user", clean_user(o.get("prompt", "")))
+        elif kind == "message-start":
+            if message.get("role") == "tool":
+                key = o.get("tool_call_id") or message.get("tool_call_id") or ""
+                tool_messages[key] = {"parts": [], "error": False}
+            else:
+                text, calls = [], {}
+        elif kind == "content-delta":
+            content = message.get("content")
+            key = o.get("tool_call_id") or message.get("tool_call_id") or ""
+            if message.get("role") == "tool" or key in tool_messages:
+                result = tool_messages.setdefault(key, {"parts": [], "error": False})
+                if isinstance(content, dict) and content.get("type") == "document":
+                    data = content.get("document", {}).get("data", {})
+                    result["parts"].append(json.dumps(data, ensure_ascii=False))
+                    result["error"] |= (data.get("success") is False or bool(data.get("error"))
+                                        or data.get("exit_code") not in (None, 0))
+                elif content:
+                    result["parts"].append(text_of(content) if isinstance(content, list) else
+                                           content if isinstance(content, str) else json.dumps(content))
+            elif isinstance(content, str):
+                text.append(content)
+            elif isinstance(content, dict) and content.get("type") == "text":
+                text.append(content.get("text", ""))
+        elif kind == "message-end":
+            key = o.get("tool_call_id") or message.get("tool_call_id") or ""
+            if key in tool_messages:
+                result = tool_messages.pop(key)
+                delta = o.get("delta") or {}
+                error = result["error"] or bool(delta.get("error")) or delta.get("finish_reason") in ("ERROR", "ERROR_LIMIT")
+                yield ("result", "\n".join(result["parts"]), error, key)
+            elif text:
+                yield ("assistant", "".join(text))
+                text = []
+        elif kind in ("tool-call-start", "tool-call-delta"):
+            index = o.get("index", 0)
+            call = calls.setdefault(index, {"name": "", "arguments": ""})
+            tool_call = message.get("tool_calls") or {}
+            if tool_call.get("tool_call_id"):
+                call["id"] = tool_call["tool_call_id"]
+            function = tool_call.get("function") or {}
+            call["name"] += function.get("name") or ""
+            arguments = function.get("arguments")
+            if isinstance(arguments, dict):
+                call["arguments"] = json.dumps(arguments)
+            elif arguments:
+                call["arguments"] += arguments
+        elif kind == "tool-call-end":
+            call = calls.pop(o.get("index", 0), None)
+            if call:
+                try:
+                    arguments = json.loads(call["arguments"] or "{}")
+                except ValueError:
+                    arguments = call["arguments"]
+                yield ("tool", call["name"], arguments, call.get("id"))
+        elif kind == "tool-result-delta":
+            key = o.get("tool_call_id") or message.get("tool_call_id") or ""
+            results.setdefault(key, []).append(message.get("content"))
+        elif kind == "tool-result-end":
+            key = o.get("tool_call_id") or message.get("tool_call_id") or ""
+            content = message.get("content")
+            chunks = results.pop(key, [])
+            if content is None:
+                content = chunks
+            output = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            delta = o.get("delta") or {}
+            error = bool(delta.get("error")) or delta.get("finish_reason") in ("ERROR", "ERROR_LIMIT")
+            yield ("result", output, error, key)
+        elif kind == "stream-end":
+            if text:
+                yield ("assistant", "".join(text))
+                text = []
+    if text:
+        yield ("assistant", "".join(text))
+
+
+PARSERS = {"claude": parse_claude, "codex": parse_codex, "codex-exec": parse_codex_exec,
+           "omp": parse_omp, "north": parse_north}
 
 PATH_KEYS = ("file_path", "path", "filePath", "notebook_path")
 
@@ -198,6 +284,7 @@ def summarize(path, fmt=None):
     task = next((e[1] for e in events if e[0] == "user"), "")
     finals = [e[1] for e in events if e[0] == "assistant"]
     steps, files, n_tools, n_err = [], set(), 0, 0
+    tool_steps = {}
     for e in events:
         if e[0] == "user" and e[1] != task:
             steps.append(f"**user:** {clip(e[1], 1500)}")
@@ -210,11 +297,14 @@ def summarize(path, fmt=None):
             if isinstance(arg, dict) and ("command" in arg or "cmd" in arg):
                 arg = arg.get("command") or arg.get("cmd")
             steps.append(f"`{e[1]}` {clip(arg, CLIP_CMD)}")
+            if len(e) > 3 and e[3]:
+                tool_steps[e[3]] = len(steps) - 1
         elif e[0] == "result":
             if e[2]:
                 n_err += 1
             if steps:
-                steps[-1] += f"\n    → {'ERROR ' if e[2] else ''}{clip(e[1] or '', CLIP_OUT)}"
+                step = tool_steps.get(e[3], len(steps) - 1) if len(e) > 3 else len(steps) - 1
+                steps[step] += f"\n    → {'ERROR ' if e[2] else ''}{clip(e[1] or '', CLIP_OUT)}"
     return {
         "source": str(path), "format": fmt, "task": task,
         "final": finals[-1] if finals else "",
